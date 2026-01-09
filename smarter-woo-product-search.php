@@ -5,7 +5,7 @@
  * Version: 0.1.0
  * Author: Custom
  * Requires at least: 5.8
- * Requires PHP: 7.4
+ * Requires PHP: 7.0
  * WC requires at least: 5.0
  * WC tested up to: 9.0
  * License: GPLv2 or later
@@ -15,202 +15,394 @@ if (!defined('ABSPATH')) {
 	exit;
 }
 
-/**
- * This plugin deliberately stays server-side and only modifies the main WP search query
- * when searching WooCommerce products using the standard URL structure.
- */
-
-add_action('pre_get_posts', function (WP_Query $query) {
-	if (is_admin()) {
-		return;
-	}
-
-	if (!$query->is_main_query() || !$query->is_search()) {
-		return;
-	}
-
-	$post_type = $query->get('post_type');
-	$is_product_search = (is_string($post_type) && $post_type === 'product')
-		|| (is_array($post_type) && in_array('product', $post_type, true));
-
-	if (!$is_product_search) {
-		return;
-	}
-
-	// Flag the query so our SQL filters can reliably detect it.
-	$query->set('_wcss_enabled', 1);
-}, 9);
+if (!defined('WCSS_SMART_SEARCH_VERSION')) {
+	define('WCSS_SMART_SEARCH_VERSION', '0.1.0');
+}
 
 /**
- * Replace the default WordPress search WHERE fragment with our own product-focused matching.
+ * Optional browser console debug bridge.
  *
- * We keep the URL and query vars identical (/?s=...&post_type=product). We only alter SQL.
+ * This helps when you want to see plugin/runtime output in DevTools.
+ * For safety, it is admin-only and requires explicit opt-in:
+ * - add `?wcss_debug=1` to the URL, OR
+ * - enable via the `wcss_console_debug_enabled` filter.
  */
-add_filter('posts_search', function ($search_sql, WP_Query $query) {
-	if (is_admin() || !$query->is_main_query() || !$query->is_search()) {
-		return $search_sql;
+function wcss_console_debug_is_enabled(): bool
+{
+	if (function_exists('wp_doing_ajax') && wp_doing_ajax()) {
+		return false;
 	}
 
-	if ((int) $query->get('_wcss_enabled') !== 1) {
-		return $search_sql;
+	if (defined('REST_REQUEST') && REST_REQUEST) {
+		return false;
 	}
 
-	global $wpdb;
-
-	$raw = (string) $query->get('s');
-	$raw = trim($raw);
-	if ($raw === '') {
-		return $search_sql;
+	if (function_exists('wp_is_json_request') && wp_is_json_request()) {
+		return false;
 	}
 
-	$payload = wcss_build_search_payload($raw);
-	$exact_terms = $payload['exact_like_terms'] ?? [];
-	$fuzzy_terms = $payload['fuzzy_like_terms'] ?? [];
-
-	if (empty($exact_terms) && empty($fuzzy_terms)) {
-		return $search_sql;
+	if (!function_exists('is_user_logged_in') || !is_user_logged_in()) {
+		return false;
 	}
 
-	// Build a conservative OR-group that matches any term across the supported fields.
-	$or = [];
-	foreach ($exact_terms as $term_like) {
-		// Title, excerpt, content.
-		$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
-		$or[] = $wpdb->prepare("{$wpdb->posts}.post_excerpt LIKE %s", $term_like);
-		$or[] = $wpdb->prepare("{$wpdb->posts}.post_content LIKE %s", $term_like);
-
-		// SKU (requires JOIN added via posts_clauses).
-		$or[] = $wpdb->prepare("pm_sku.meta_value LIKE %s", $term_like);
-
-		// Taxonomy terms (requires JOIN added via posts_clauses).
-		$or[] = $wpdb->prepare("(wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)", $term_like, $term_like);
+	if (!function_exists('current_user_can') || !current_user_can('manage_options')) {
+		return false;
 	}
 
-	// Fuzzy terms (typo-tolerant): keep these narrower for performance/precision.
-	// We apply fuzzy matching primarily to title and SKU.
-	foreach ($fuzzy_terms as $term_like) {
-		$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
-		$or[] = $wpdb->prepare("pm_sku.meta_value LIKE %s", $term_like);
+	// Explicit opt-in via URL (admin-only).
+	if (isset($_GET['wcss_debug']) && (string) $_GET['wcss_debug'] === '1') {
+		return true;
 	}
 
-	$or_sql = implode(' OR ', array_unique($or));
-	if ($or_sql === '') {
-		return $search_sql;
+	// Or enable programmatically.
+	return (bool) apply_filters('wcss_console_debug_enabled', false);
+}
+
+function wcss_console_debug_bootstrap(): void
+{
+	if (!wcss_console_debug_is_enabled()) {
+		return;
 	}
 
-	return " AND ({$or_sql}) ";
-}, 20, 2);
+	if (!isset($GLOBALS['wcss_console_debug_buffer']) || !is_array($GLOBALS['wcss_console_debug_buffer'])) {
+		$GLOBALS['wcss_console_debug_buffer'] = [];
+	}
 
-/**
- * Add JOINs + relevance scoring + stable ordering.
- *
- * - Ensures SKU and taxonomy matching works.
- * - Adds a computed relevance score (weighted matches) and orders by it.
- * - GROUP BY post ID to dedupe products when taxonomy joins expand rows.
- */
-add_filter('posts_clauses', function (array $clauses, WP_Query $query) {
-	if (is_admin() || !$query->is_main_query() || !$query->is_search()) {
+	set_error_handler('wcss_console_debug_error_handler');
+	register_shutdown_function('wcss_console_debug_shutdown');
+
+	wcss_console_debug_log('WP_DEBUG console bridge enabled', [
+		'plugin' => 'Smarter Woo Product Search',
+		'version' => defined('WCSS_SMART_SEARCH_VERSION') ? WCSS_SMART_SEARCH_VERSION : null,
+	]);
+
+	add_action('wp_head', 'wcss_console_debug_print', 1);
+	add_action('admin_head', 'wcss_console_debug_print', 1);
+	add_action('wp_footer', 'wcss_console_debug_print', 999);
+	add_action('admin_footer', 'wcss_console_debug_print', 999);
+}
+
+function wcss_console_debug_log(string $message, array $context = []): void
+{
+	if (!wcss_console_debug_is_enabled()) {
+		return;
+	}
+
+	$GLOBALS['wcss_console_debug_buffer'][] = [
+		't' => 'log',
+		'message' => $message,
+		'context' => $context,
+	];
+}
+
+function wcss_console_debug_error_handler($errno, $errstr, $errfile = '', $errline = 0): bool
+{
+	if (!wcss_console_debug_is_enabled()) {
+		return false;
+	}
+
+	$GLOBALS['wcss_console_debug_buffer'][] = [
+		't' => 'php',
+		'errno' => (int) $errno,
+		'message' => (string) $errstr,
+		'file' => (string) $errfile,
+		'line' => (int) $errline,
+	];
+
+	// Let WordPress/PHP handle it too.
+	return false;
+}
+
+function wcss_console_debug_shutdown(): void
+{
+	if (!wcss_console_debug_is_enabled()) {
+		return;
+	}
+
+	$last = error_get_last();
+	if (is_array($last) && !empty($last['message'])) {
+		$GLOBALS['wcss_console_debug_buffer'][] = [
+			't' => 'shutdown',
+			'errno' => isset($last['type']) ? (int) $last['type'] : 0,
+			'message' => (string) ($last['message'] ?? ''),
+			'file' => (string) ($last['file'] ?? ''),
+			'line' => (int) ($last['line'] ?? 0),
+		];
+	}
+}
+
+function wcss_console_debug_print(): void
+{
+	static $printed = false;
+	if ($printed) {
+		return;
+	}
+	$printed = true;
+
+	if (!wcss_console_debug_is_enabled()) {
+		return;
+	}
+
+	$buffer = isset($GLOBALS['wcss_console_debug_buffer']) && is_array($GLOBALS['wcss_console_debug_buffer'])
+		? $GLOBALS['wcss_console_debug_buffer']
+		: [];
+
+	// Always print the group header when enabled so we can confirm it's working.
+
+	// Reduce sensitive path exposure: keep only the basename.
+	foreach ($buffer as &$row) {
+		if (isset($row['file']) && is_string($row['file']) && $row['file'] !== '') {
+			$row['file'] = basename($row['file']);
+		}
+	}
+	unset($row);
+
+	$payload = wp_json_encode($buffer);
+	if (!is_string($payload) || $payload === '') {
+		return;
+	}
+
+	echo "\n<script>\n";
+	echo "(function(){\n";
+	echo "  var items = {$payload};\n";
+	echo "  try { console.groupCollapsed('WP_DEBUG (Smarter Search)'); } catch(e) {}\n";
+	echo "  for (var i=0;i<items.length;i++){\n";
+	echo "    var it = items[i] || {};\n";
+	echo "    var loc = (it.file ? it.file : '') + (it.line ? (':' + it.line) : '');\n";
+	echo "    var prefix = (it.t === 'php' || it.t === 'shutdown') ? '[PHP]' : '[LOG]';\n";
+	echo "    console.log(prefix, it.message || it.m || '', loc, it.context || it);\n";
+	echo "  }\n";
+	echo "  try { console.groupEnd(); } catch(e) {}\n";
+	echo "})();\n";
+	echo "</script>\n";
+}
+
+add_action('plugins_loaded', 'wcss_console_debug_bootstrap', 1);
+
+final class WCSS_Smarter_Search
+{
+	private static $instance = null;
+
+	public static function init(): self
+	{
+		if (null === self::$instance) {
+			self::$instance = new self();
+		}
+
+		return self::$instance;
+	}
+
+	private function __construct()
+	{
+		add_action('pre_get_posts', [$this, 'flag_product_search_queries'], 9);
+		add_filter('posts_search', [$this, 'filter_posts_search'], 20, 2);
+		add_filter('posts_clauses', [$this, 'filter_posts_clauses'], 20, 2);
+	}
+
+	public function flag_product_search_queries(WP_Query $query)
+	{
+		if (is_admin() || !$query->is_main_query()) {
+			return;
+		}
+
+		$raw = $query->get('s');
+		$has_search_term = is_string($raw) && trim($raw) !== '';
+		if (!$query->is_search() && !$has_search_term) {
+			return;
+		}
+
+		$post_type = $query->get('post_type');
+		$is_product_search = (is_string($post_type) && $post_type === 'product')
+			|| (is_array($post_type) && in_array('product', $post_type, true));
+
+		if (!$is_product_search) {
+			return;
+		}
+
+		$query->set('_wcss_enabled', 1);
+
+		if (function_exists('wcss_console_debug_log')) {
+			wcss_console_debug_log('WCSS flagged product search query', [
+				's' => (string) $query->get('s'),
+				'post_type' => $post_type,
+			]);
+		}
+	}
+
+	public function filter_posts_search($search_sql, WP_Query $query)
+	{
+		if (!$this->should_handle_query($query)) {
+			return $search_sql;
+		}
+
+		$payload = $this->get_like_terms($query);
+		$exact_terms = $payload['exact'];
+		$fuzzy_terms = $payload['fuzzy'];
+
+		if (empty($exact_terms) && empty($fuzzy_terms)) {
+			return $search_sql;
+		}
+
+		global $wpdb;
+		$or = [];
+
+		foreach ($exact_terms as $term_like) {
+			$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("{$wpdb->posts}.post_excerpt LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("{$wpdb->posts}.post_content LIKE %s", $term_like);
+			$or[] = $wpdb->prepare('pm_sku.meta_value LIKE %s', $term_like);
+			$or[] = $wpdb->prepare('(wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)', $term_like, $term_like);
+		}
+
+		foreach ($fuzzy_terms as $term_like) {
+			$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
+			$or[] = $wpdb->prepare('pm_sku.meta_value LIKE %s', $term_like);
+		}
+
+		$or_sql = implode(' OR ', array_unique($or));
+		if ($or_sql === '') {
+			return $search_sql;
+		}
+
+		return " AND ({$or_sql}) ";
+	}
+
+	public function filter_posts_clauses(array $clauses, WP_Query $query): array
+	{
+		if (!$this->should_handle_query($query)) {
+			return $clauses;
+		}
+
+		$payload = $this->get_like_terms($query);
+		$exact_terms = $payload['exact'];
+		$fuzzy_terms = $payload['fuzzy'];
+
+		if (empty($exact_terms) && empty($fuzzy_terms)) {
+			return $clauses;
+		}
+
+		global $wpdb;
+		$weights = wcss_get_weights();
+
+		$join = isset($clauses['join']) ? (string) $clauses['join'] : '';
+		if (strpos($join, 'pm_sku') === false) {
+			$join .= "\nLEFT JOIN {$wpdb->postmeta} AS pm_sku ON (pm_sku.post_id = {$wpdb->posts}.ID AND pm_sku.meta_key = '_sku')";
+		}
+		if (strpos($join, 'wcss_tr') === false) {
+			$join .= "\nLEFT JOIN {$wpdb->term_relationships} AS wcss_tr ON (wcss_tr.object_id = {$wpdb->posts}.ID)";
+		}
+		if (strpos($join, 'wcss_tt') === false) {
+			$join .= "\nLEFT JOIN {$wpdb->term_taxonomy} AS wcss_tt ON (wcss_tt.term_taxonomy_id = wcss_tr.term_taxonomy_id AND (wcss_tt.taxonomy IN ('product_cat','product_tag') OR wcss_tt.taxonomy LIKE 'pa_%'))";
+		}
+		if (strpos($join, 'wcss_t') === false) {
+			$join .= "\nLEFT JOIN {$wpdb->terms} AS wcss_t ON (wcss_t.term_id = wcss_tt.term_id)";
+		}
+
+		$clauses['join'] = $join;
+		$score_parts = [];
+
+		foreach ($exact_terms as $term_like) {
+			$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_title LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['title']);
+			$score_parts[] = $wpdb->prepare("(CASE WHEN pm_sku.meta_value LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['sku']);
+			$score_parts[] = $wpdb->prepare(
+				"(CASE WHEN (wcss_tt.taxonomy LIKE 'pa_%' AND (wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)) THEN %d ELSE 0 END)",
+				$term_like,
+				$term_like,
+				(int) $weights['attribute']
+			);
+			$score_parts[] = $wpdb->prepare(
+				"(CASE WHEN (wcss_tt.taxonomy IN ('product_cat','product_tag') AND (wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)) THEN %d ELSE 0 END)",
+				$term_like,
+				$term_like,
+				(int) $weights['taxonomy']
+			);
+			$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_excerpt LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['excerpt']);
+			$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_content LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['content']);
+		}
+
+		foreach ($fuzzy_terms as $term_like) {
+			$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_title LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['title_fuzzy']);
+			$score_parts[] = $wpdb->prepare("(CASE WHEN pm_sku.meta_value LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['sku_fuzzy']);
+		}
+
+		$score_sql = implode(' + ', $score_parts);
+		if ($score_sql === '') {
+			return $clauses;
+		}
+
+		$fields = isset($clauses['fields']) ? (string) $clauses['fields'] : "{$wpdb->posts}.*";
+		if (strpos($fields, 'wcss_relevance') === false) {
+			$fields .= ", ({$score_sql}) AS wcss_relevance";
+		}
+		$clauses['fields'] = $fields;
+
+		$groupby = isset($clauses['groupby']) ? trim((string) $clauses['groupby']) : '';
+		if ($groupby === '') {
+			$clauses['groupby'] = "{$wpdb->posts}.ID";
+		} elseif (stripos($groupby, "{$wpdb->posts}.ID") === false) {
+			$clauses['groupby'] .= ", {$wpdb->posts}.ID";
+		}
+
+		$clauses['orderby'] = "wcss_relevance DESC, {$wpdb->posts}.post_date DESC";
+
 		return $clauses;
 	}
 
-	if ((int) $query->get('_wcss_enabled') !== 1) {
-		return $clauses;
+	private function should_handle_query(WP_Query $query): bool
+	{
+		if (is_admin() || !$query->is_main_query()) {
+			return false;
+		}
+
+		$raw = $query->get('s');
+		$has_search_term = is_string($raw) && trim($raw) !== '';
+		if (!$query->is_search() && !$has_search_term) {
+			return false;
+		}
+
+		return (int) $query->get('_wcss_enabled') === 1;
 	}
 
-	global $wpdb;
+	private function get_like_terms(WP_Query $query): array
+	{
+		$raw = (string) $query->get('s');
+		$raw = trim($raw);
+		if ($raw === '') {
+			return ['exact' => [], 'fuzzy' => []];
+		}
 
-	$raw = (string) $query->get('s');
-	$raw = trim($raw);
-	if ($raw === '') {
-		return $clauses;
+		$payload = wcss_build_search_payload($raw);
+		if (function_exists('wcss_console_debug_log')) {
+			wcss_console_debug_log('WCSS payload built', [
+				'raw' => $raw,
+				'exact_like_terms' => isset($payload['exact_like_terms']) ? (array) $payload['exact_like_terms'] : [],
+				'fuzzy_like_terms' => isset($payload['fuzzy_like_terms']) ? (array) $payload['fuzzy_like_terms'] : [],
+			]);
+		}
+
+		return [
+			'exact' => $payload['exact_like_terms'] ?? [],
+			'fuzzy' => $payload['fuzzy_like_terms'] ?? [],
+		];
+	}
+}
+
+function wcss_maybe_bootstrap(): void
+{
+	if (!function_exists('add_action')) {
+		return;
 	}
 
-	$payload = wcss_build_search_payload($raw);
-	$exact_terms = $payload['exact_like_terms'] ?? [];
-	$fuzzy_terms = $payload['fuzzy_like_terms'] ?? [];
-
-	if (empty($exact_terms) && empty($fuzzy_terms)) {
-		return $clauses;
+	if (class_exists('WooCommerce') || function_exists('WC')) {
+		WCSS_Smarter_Search::init();
 	}
+}
 
-	$weights = wcss_get_weights();
+add_action('plugins_loaded', 'wcss_maybe_bootstrap', 11);
 
-	// JOIN SKU postmeta.
-	$join = isset($clauses['join']) ? (string) $clauses['join'] : '';
-	if (strpos($join, 'pm_sku') === false) {
-		$join .= "\nLEFT JOIN {$wpdb->postmeta} AS pm_sku ON (pm_sku.post_id = {$wpdb->posts}.ID AND pm_sku.meta_key = '_sku')";
-	}
-
-	// JOIN product taxonomies (categories, tags, attributes pa_*).
-	// We restrict term_taxonomy join to only the relevant taxonomies to reduce row expansion.
-	if (strpos($join, 'wcss_tr') === false) {
-		$join .= "\nLEFT JOIN {$wpdb->term_relationships} AS wcss_tr ON (wcss_tr.object_id = {$wpdb->posts}.ID)";
-	}
-	if (strpos($join, 'wcss_tt') === false) {
-		$join .= "\nLEFT JOIN {$wpdb->term_taxonomy} AS wcss_tt ON (wcss_tt.term_taxonomy_id = wcss_tr.term_taxonomy_id AND (wcss_tt.taxonomy IN ('product_cat','product_tag') OR wcss_tt.taxonomy LIKE 'pa_%'))";
-	}
-	if (strpos($join, 'wcss_t') === false) {
-		$join .= "\nLEFT JOIN {$wpdb->terms} AS wcss_t ON (wcss_t.term_id = wcss_tt.term_id)";
-	}
-
-	$clauses['join'] = $join;
-
-	// Relevance scoring: higher weights for title and SKU, then attributes, then excerpt/content.
-	$score_parts = [];
-	foreach ($exact_terms as $term_like) {
-		$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_title LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['title']);
-		$score_parts[] = $wpdb->prepare("(CASE WHEN pm_sku.meta_value LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['sku']);
-
-		// Attributes (pa_*) weighted higher than categories/tags.
-		$score_parts[] = $wpdb->prepare(
-			"(CASE WHEN (wcss_tt.taxonomy LIKE 'pa_%' AND (wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)) THEN %d ELSE 0 END)",
-			$term_like,
-			$term_like,
-			(int) $weights['attribute']
-		);
-
-		$score_parts[] = $wpdb->prepare(
-			"(CASE WHEN (wcss_tt.taxonomy IN ('product_cat','product_tag') AND (wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)) THEN %d ELSE 0 END)",
-			$term_like,
-			$term_like,
-			(int) $weights['taxonomy']
-		);
-
-		$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_excerpt LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['excerpt']);
-		$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_content LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['content']);
-	}
-
-	// Fuzzy scoring: lower weight so typo-tolerance doesn't outrank exact matches.
-	foreach ($fuzzy_terms as $term_like) {
-		$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_title LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['title_fuzzy']);
-		$score_parts[] = $wpdb->prepare("(CASE WHEN pm_sku.meta_value LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['sku_fuzzy']);
-	}
-
-	$score_sql = implode(' + ', $score_parts);
-	if ($score_sql === '') {
-		return $clauses;
-	}
-
-	// Add score to SELECT.
-	$fields = isset($clauses['fields']) ? (string) $clauses['fields'] : "{$wpdb->posts}.*";
-	if (strpos($fields, 'wcss_relevance') === false) {
-		$fields .= ", ({$score_sql}) AS wcss_relevance";
-	}
-	$clauses['fields'] = $fields;
-
-	// Dedupe products (taxonomy joins can produce multiple rows per product).
-	$groupby = isset($clauses['groupby']) ? trim((string) $clauses['groupby']) : '';
-	if ($groupby === '') {
-		$clauses['groupby'] = "{$wpdb->posts}.ID";
-	} elseif (stripos($groupby, "{$wpdb->posts}.ID") === false) {
-		$clauses['groupby'] .= ", {$wpdb->posts}.ID";
-	}
-
-	// Order by relevance first, then recency.
-	$clauses['orderby'] = "wcss_relevance DESC, {$wpdb->posts}.post_date DESC";
-
-	return $clauses;
-}, 20, 2);
+add_action('woocommerce_init', static function () {
+	WCSS_Smarter_Search::init();
+});
 
 /**
  * Build LIKE-ready search terms for partial matching + conservative synonym expansion.
