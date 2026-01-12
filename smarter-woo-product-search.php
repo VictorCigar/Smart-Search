@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Smarter Woo Product Search
  * Description: Enhances the default WooCommerce product search (/?s=...&post_type=product) with weighting, SKU + taxonomy matching, partial matches, and synonyms — without changing the search form or URL structure.
- * Version: 0.1.0
+ * Version: 0.1.12
  * Author: Custom
  * Requires at least: 5.8
  * Requires PHP: 7.0
@@ -16,7 +16,7 @@ if (!defined('ABSPATH')) {
 }
 
 if (!defined('WCSS_SMART_SEARCH_VERSION')) {
-	define('WCSS_SMART_SEARCH_VERSION', '0.1.0');
+	define('WCSS_SMART_SEARCH_VERSION', '0.1.12');
 }
 
 /**
@@ -68,23 +68,30 @@ function wcss_console_debug_bootstrap(): void
 		$GLOBALS['wcss_console_debug_buffer'] = [];
 	}
 
+	$GLOBALS['wcss_console_debug_active'] = true;
+
 	set_error_handler('wcss_console_debug_error_handler');
 	register_shutdown_function('wcss_console_debug_shutdown');
 
-	wcss_console_debug_log('WP_DEBUG console bridge enabled', [
+	// Write directly to buffer so we don't depend on re-checking auth mid-request.
+	$GLOBALS['wcss_console_debug_buffer'][] = [
+		't' => 'log',
+		'message' => 'WP_DEBUG console bridge enabled',
+		'context' => [
 		'plugin' => 'Smarter Woo Product Search',
 		'version' => defined('WCSS_SMART_SEARCH_VERSION') ? WCSS_SMART_SEARCH_VERSION : null,
-	]);
+		],
+	];
 
-	add_action('wp_head', 'wcss_console_debug_print', 1);
-	add_action('admin_head', 'wcss_console_debug_print', 1);
+	// Print late so we capture logs produced during query building and template rendering.
 	add_action('wp_footer', 'wcss_console_debug_print', 999);
 	add_action('admin_footer', 'wcss_console_debug_print', 999);
 }
 
 function wcss_console_debug_log(string $message, array $context = []): void
 {
-	if (!wcss_console_debug_is_enabled()) {
+	// Only log if we've bootstrapped the buffer for this request.
+	if (!isset($GLOBALS['wcss_console_debug_buffer']) || !is_array($GLOBALS['wcss_console_debug_buffer'])) {
 		return;
 	}
 
@@ -97,7 +104,7 @@ function wcss_console_debug_log(string $message, array $context = []): void
 
 function wcss_console_debug_error_handler($errno, $errstr, $errfile = '', $errline = 0): bool
 {
-	if (!wcss_console_debug_is_enabled()) {
+	if (!isset($GLOBALS['wcss_console_debug_buffer']) || !is_array($GLOBALS['wcss_console_debug_buffer'])) {
 		return false;
 	}
 
@@ -115,7 +122,7 @@ function wcss_console_debug_error_handler($errno, $errstr, $errfile = '', $errli
 
 function wcss_console_debug_shutdown(): void
 {
-	if (!wcss_console_debug_is_enabled()) {
+	if (!isset($GLOBALS['wcss_console_debug_buffer']) || !is_array($GLOBALS['wcss_console_debug_buffer'])) {
 		return;
 	}
 
@@ -147,7 +154,16 @@ function wcss_console_debug_print(): void
 		? $GLOBALS['wcss_console_debug_buffer']
 		: [];
 
-	// Always print the group header when enabled so we can confirm it's working.
+	if (empty($buffer)) {
+		$buffer[] = [
+			't' => 'log',
+			'message' => 'WCSS debug enabled, but no logs were captured (buffer empty)',
+			'context' => [
+				'version' => defined('WCSS_SMART_SEARCH_VERSION') ? WCSS_SMART_SEARCH_VERSION : null,
+				'request_uri' => isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : null,
+			],
+		];
+	}
 
 	// Reduce sensitive path exposure: keep only the basename.
 	foreach ($buffer as &$row) {
@@ -165,16 +181,41 @@ function wcss_console_debug_print(): void
 	echo "\n<script>\n";
 	echo "(function(){\n";
 	echo "  var items = {$payload};\n";
-	echo "  try { console.groupCollapsed('WP_DEBUG (Smarter Search)'); } catch(e) {}\n";
+	$label = 'WP_DEBUG (Smarter Search)';
+	if (defined('WCSS_SMART_SEARCH_VERSION')) {
+		$label .= ' v' . WCSS_SMART_SEARCH_VERSION;
+	}
+	echo "  try { console.groupCollapsed(" . wp_json_encode($label) . "); } catch(e) {}\n";
 	echo "  for (var i=0;i<items.length;i++){\n";
 	echo "    var it = items[i] || {};\n";
 	echo "    var loc = (it.file ? it.file : '') + (it.line ? (':' + it.line) : '');\n";
 	echo "    var prefix = (it.t === 'php' || it.t === 'shutdown') ? '[PHP]' : '[LOG]';\n";
 	echo "    console.log(prefix, it.message || it.m || '', loc, it.context || it);\n";
+	echo "    try { if (it && it.context && typeof it.context.sql === 'string' && it.context.sql) { console.log('[SQL]', it.context.sql); } } catch(e) {}\n";
 	echo "  }\n";
 	echo "  try { console.groupEnd(); } catch(e) {}\n";
 	echo "})();\n";
 	echo "</script>\n";
+}
+function wcss_console_debug_truncate(string $s, int $max = 2000): string
+{
+	$s = trim($s);
+	if ($max < 0) {
+		$max = 0;
+	}
+	if ($max === 0 || $s === '') {
+		return $s;
+	}
+	if (function_exists('mb_strlen') && function_exists('mb_substr')) {
+		if (mb_strlen($s) <= $max) {
+			return $s;
+		}
+		return mb_substr($s, 0, $max) . '…';
+	}
+	if (strlen($s) <= $max) {
+		return $s;
+	}
+	return substr($s, 0, $max) . '…';
 }
 
 add_action('plugins_loaded', 'wcss_console_debug_bootstrap', 1);
@@ -195,8 +236,148 @@ final class WCSS_Smarter_Search
 	private function __construct()
 	{
 		add_action('pre_get_posts', [$this, 'flag_product_search_queries'], 9);
-		add_filter('posts_search', [$this, 'filter_posts_search'], 20, 2);
+		// Re-assert constraints after other plugins/hosts modify the query.
+		add_action('pre_get_posts', [$this, 'enforce_wcss_query_constraints'], PHP_INT_MAX);
+		// Keep the UI (templates/search forms) showing the original term even though we blank `s`.
+		add_filter('get_search_query', [$this, 'filter_get_search_query'], 9999);
+		// Run very late to override hosts/plugins that rewrite search to REGEXP or other forms.
+		add_filter('posts_search', [$this, 'filter_posts_search'], 9999, 2);
+		// Last-resort cleanup for hosts that inject REGEXP search via posts_where after posts_search.
+		add_filter('posts_where', [$this, 'filter_posts_where'], PHP_INT_MAX, 2);
 		add_filter('posts_clauses', [$this, 'filter_posts_clauses'], 20, 2);
+		// Log very late so we see the actual final SQL after other filters run.
+		add_filter('posts_request', [$this, 'debug_posts_request'], 999, 2);
+		add_filter('posts_results', [$this, 'debug_posts_results'], 20, 2);
+	}
+
+	public function filter_get_search_query($search_query)
+	{
+		if (is_admin()) {
+			return $search_query;
+		}
+
+		if (!isset($GLOBALS['wp_query']) || !($GLOBALS['wp_query'] instanceof WP_Query)) {
+			return $search_query;
+		}
+
+		/** @var WP_Query $q */
+		$q = $GLOBALS['wp_query'];
+		if ((int) $q->get('_wcss_enabled') !== 1) {
+			return $search_query;
+		}
+
+		$raw = $q->get('_wcss_raw_s');
+		if (!is_string($raw)) {
+			return $search_query;
+		}
+		$raw = trim($raw);
+		if ($raw === '') {
+			return $search_query;
+		}
+
+		return $raw;
+	}
+
+	public function filter_posts_where($where, WP_Query $query)
+	{
+		if (!$this->should_handle_query($query)) {
+			return $where;
+		}
+
+		$raw = (string) $query->get('_wcss_raw_s');
+		$raw = trim($raw);
+		if ($raw === '') {
+			return $where;
+		}
+
+		$where_str = is_string($where) ? $where : '';
+		if ($where_str === '' || stripos($where_str, 'regexp') === false) {
+			return $where;
+		}
+
+		$raw_re = preg_quote($raw, '/');
+		$before = $where_str;
+
+		// Typical injected shape we saw on WP.com staging:
+		// AND ( ((wp_posts.post_title REGEXP '...sush...' ) OR (wp_posts.post_content REGEXP '...sush...' AND wp_posts.post_password = '') OR (wp_posts.post_excerpt REGEXP '...sush...')))
+		$where_str = preg_replace(
+			"/\\s+AND\\s*\\(\\s*\\(\\(\\((?:[a-zA-Z0-9_]+\\.)?post_title\\s+REGEXP\\s+'[^']*{$raw_re}[^']*'\\)\\s+OR\\s+\\((?:[a-zA-Z0-9_]+\\.)?post_content\\s+REGEXP\\s+'[^']*{$raw_re}[^']*'[^)]*\\)\\s+OR\\s+\\((?:[a-zA-Z0-9_]+\\.)?post_excerpt\\s+REGEXP\\s+'[^']*{$raw_re}[^']*'\\)\\)\\)\\s*\\)\\s*\\)/i",
+			'',
+			$where_str
+		);
+
+		if ($where_str !== $before && function_exists('wcss_console_debug_log')) {
+			wcss_console_debug_log('WCSS stripped injected REGEXP search clause', [
+				'raw' => $raw,
+			]);
+		}
+
+		return $where_str;
+	}
+
+	public function debug_posts_request($request, WP_Query $query)
+	{
+		if (!wcss_console_debug_is_enabled()) {
+			return $request;
+		}
+		if (!$this->should_handle_query($query)) {
+			return $request;
+		}
+
+		$request_str = is_string($request) ? $request : '';
+		if ($request_str !== '') {
+			// Keep it readable in the browser console.
+			$request_str = preg_replace('/\s+/u', ' ', trim($request_str));
+		}
+
+		wcss_console_debug_log('WCSS final SQL', [
+			'sql' => $request_str,
+		]);
+
+		return $request;
+	}
+
+	public function debug_posts_results($posts, WP_Query $query)
+	{
+		if (!wcss_console_debug_is_enabled()) {
+			return $posts;
+		}
+		if (!$this->should_handle_query($query)) {
+			return $posts;
+		}
+
+		global $wpdb;
+
+		// WP_Query stores the main SELECT in $query->request; this is often more useful than $wpdb->last_query
+		// because WP might run SELECT FOUND_ROWS() after the main query.
+		if (isset($query->request) && is_string($query->request) && trim($query->request) !== '') {
+			$request_sql = preg_replace('/\s+/u', ' ', trim($query->request));
+			wcss_console_debug_log('WCSS main query SQL (query->request)', [
+				'sql' => wcss_console_debug_truncate($request_sql, 6000),
+			]);
+		}
+
+		$last_error = isset($wpdb->last_error) ? (string) $wpdb->last_error : '';
+		if ($last_error !== '') {
+			wcss_console_debug_log('WCSS DB error', [
+				'last_error' => $last_error,
+			]);
+		}
+
+		$last_query = isset($wpdb->last_query) ? (string) $wpdb->last_query : '';
+		if ($last_query !== '') {
+			$last_query = preg_replace('/\s+/u', ' ', trim($last_query));
+			wcss_console_debug_log('WCSS executed SQL (last_query)', [
+				'sql' => wcss_console_debug_truncate($last_query, 2500),
+				'contains_placeholder_escape' => (strpos($last_query, '{') !== false && strpos($last_query, '}') !== false),
+			]);
+		}
+
+		wcss_console_debug_log('WCSS results', [
+			'count' => is_array($posts) ? count($posts) : null,
+		]);
+
+		return $posts;
 	}
 
 	public function flag_product_search_queries(WP_Query $query)
@@ -220,12 +401,41 @@ final class WCSS_Smarter_Search
 		}
 
 		$query->set('_wcss_enabled', 1);
+		// IMPORTANT: Many hosts/plugins rewrite WP's default search clause to REGEXP based on the public `s` var.
+		// That REGEXP will exclude typo queries like "sush" before our fuzzy LIKE logic can include matches.
+		// So we stash the real search term and blank out `s` to prevent any default/rewritten search clause.
+		$query->set('_wcss_raw_s', (string) $query->get('s'));
+		$query->set('s', '');
 
 		if (function_exists('wcss_console_debug_log')) {
 			wcss_console_debug_log('WCSS flagged product search query', [
-				's' => (string) $query->get('s'),
+				's' => (string) $query->get('_wcss_raw_s'),
 				'post_type' => $post_type,
 			]);
+		}
+	}
+
+	public function enforce_wcss_query_constraints(WP_Query $query)
+	{
+		if (!$this->should_handle_query($query)) {
+			return;
+		}
+
+		// Keep query limited to products even if another plugin broadens it.
+		$post_type = $query->get('post_type');
+		$needs_fix = true;
+		if (is_string($post_type) && $post_type === 'product') {
+			$needs_fix = false;
+		} elseif (is_array($post_type) && count($post_type) === 1 && isset($post_type[0]) && $post_type[0] === 'product') {
+			$needs_fix = false;
+		}
+		if ($needs_fix) {
+			$query->set('post_type', 'product');
+		}
+
+		// Ensure the public `s` remains blank so default search SQL doesn't come back.
+		if ((string) $query->get('s') !== '') {
+			$query->set('s', '');
 		}
 	}
 
@@ -238,13 +448,60 @@ final class WCSS_Smarter_Search
 		$payload = $this->get_like_terms($query);
 		$exact_terms = $payload['exact'];
 		$fuzzy_terms = $payload['fuzzy'];
+		$compact_terms = $payload['compact'];
 
-		if (empty($exact_terms) && empty($fuzzy_terms)) {
+		if (empty($exact_terms) && empty($fuzzy_terms) && empty($compact_terms)) {
 			return $search_sql;
 		}
 
 		global $wpdb;
 		$or = [];
+
+		if (function_exists('wcss_console_debug_is_enabled') && wcss_console_debug_is_enabled()) {
+			$sample_fuzzy = array_slice(array_values((array) $fuzzy_terms), 0, 2);
+			$sample_exact = array_slice(array_values((array) $exact_terms), 0, 1);
+			$diagnostic_terms = array_merge($sample_exact, $sample_fuzzy);
+			$diagnostics = [];
+
+			foreach ($diagnostic_terms as $term_like) {
+				$term_like = (string) $term_like;
+				if ($term_like === '') {
+					continue;
+				}
+
+				$title_count = (int) $wpdb->get_var($wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p WHERE p.post_type = 'product' AND p.post_status = 'publish' AND p.post_title LIKE %s",
+					$term_like
+				));
+				$excerpt_count = (int) $wpdb->get_var($wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p WHERE p.post_type = 'product' AND p.post_status = 'publish' AND p.post_excerpt LIKE %s",
+					$term_like
+				));
+				$sku_count = (int) $wpdb->get_var($wpdb->prepare(
+					"SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON (p.ID = pm.post_id) WHERE p.post_type = 'product' AND p.post_status = 'publish' AND pm.meta_key = '_sku' AND pm.meta_value LIKE %s",
+					$term_like
+				));
+				$content_count = (int) $wpdb->get_var($wpdb->prepare(
+					"SELECT COUNT(DISTINCT p.ID) FROM {$wpdb->posts} p WHERE p.post_type = 'product' AND p.post_status = 'publish' AND p.post_content LIKE %s",
+					$term_like
+				));
+
+				$diagnostics[] = [
+					'term' => $term_like,
+					'title_matches' => $title_count,
+					'excerpt_matches' => $excerpt_count,
+					'content_matches' => $content_count,
+					'sku_matches' => $sku_count,
+				];
+			}
+
+			if (!empty($diagnostics)) {
+				wcss_console_debug_log('WCSS diagnostic match counts (publish products)', [
+					'note' => 'These counts ignore product visibility/exclusion tax queries; they are only a quick check that the LIKE patterns match any publish product fields at all.',
+					'counts' => $diagnostics,
+				]);
+			}
+		}
 
 		foreach ($exact_terms as $term_like) {
 			$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
@@ -256,12 +513,34 @@ final class WCSS_Smarter_Search
 
 		foreach ($fuzzy_terms as $term_like) {
 			$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("{$wpdb->posts}.post_excerpt LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("{$wpdb->posts}.post_content LIKE %s", $term_like);
 			$or[] = $wpdb->prepare('pm_sku.meta_value LIKE %s', $term_like);
+			$or[] = $wpdb->prepare('(wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)', $term_like, $term_like);
+		}
+
+		// Space-insensitive phrase matching: allow `productname` to match `product name`.
+		// This uses REPLACE(..., ' ', '') so it only strips regular spaces (not all whitespace).
+		foreach ($compact_terms as $term_like) {
+			$or[] = $wpdb->prepare("REPLACE({$wpdb->posts}.post_title, ' ', '') LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("REPLACE({$wpdb->posts}.post_excerpt, ' ', '') LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("REPLACE({$wpdb->posts}.post_content, ' ', '') LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("REPLACE(pm_sku.meta_value, ' ', '') LIKE %s", $term_like);
+			$or[] = $wpdb->prepare("(REPLACE(wcss_t.name, ' ', '') LIKE %s OR wcss_t.slug LIKE %s)", $term_like, $term_like);
 		}
 
 		$or_sql = implode(' OR ', array_unique($or));
 		if ($or_sql === '') {
 			return $search_sql;
+		}
+
+		if (function_exists('wcss_console_debug_is_enabled') && wcss_console_debug_is_enabled()) {
+			wcss_console_debug_log('WCSS search OR', [
+				'exact_like_terms' => $exact_terms,
+				'fuzzy_like_terms' => $fuzzy_terms,
+				'compact_like_terms' => $compact_terms,
+				'or_sql' => $or_sql,
+			]);
 		}
 
 		return " AND ({$or_sql}) ";
@@ -276,8 +555,9 @@ final class WCSS_Smarter_Search
 		$payload = $this->get_like_terms($query);
 		$exact_terms = $payload['exact'];
 		$fuzzy_terms = $payload['fuzzy'];
+		$compact_terms = $payload['compact'];
 
-		if (empty($exact_terms) && empty($fuzzy_terms)) {
+		if (empty($exact_terms) && empty($fuzzy_terms) && empty($compact_terms)) {
 			return $clauses;
 		}
 
@@ -294,7 +574,8 @@ final class WCSS_Smarter_Search
 		if (strpos($join, 'wcss_tt') === false) {
 			$join .= "\nLEFT JOIN {$wpdb->term_taxonomy} AS wcss_tt ON (wcss_tt.term_taxonomy_id = wcss_tr.term_taxonomy_id AND (wcss_tt.taxonomy IN ('product_cat','product_tag') OR wcss_tt.taxonomy LIKE 'pa_%'))";
 		}
-		if (strpos($join, 'wcss_t') === false) {
+		// IMPORTANT: Don't check for plain 'wcss_t' substring because 'wcss_tt' contains it.
+		if (!preg_match('/\bAS\s+wcss_t\b/i', $join)) {
 			$join .= "\nLEFT JOIN {$wpdb->terms} AS wcss_t ON (wcss_t.term_id = wcss_tt.term_id)";
 		}
 
@@ -325,6 +606,11 @@ final class WCSS_Smarter_Search
 			$score_parts[] = $wpdb->prepare("(CASE WHEN pm_sku.meta_value LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['sku_fuzzy']);
 		}
 
+		foreach ($compact_terms as $term_like) {
+			$score_parts[] = $wpdb->prepare("(CASE WHEN REPLACE({$wpdb->posts}.post_title, ' ', '') LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['title_fuzzy']);
+			$score_parts[] = $wpdb->prepare("(CASE WHEN REPLACE(pm_sku.meta_value, ' ', '') LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['sku_fuzzy']);
+		}
+
 		$score_sql = implode(' + ', $score_parts);
 		if ($score_sql === '') {
 			return $clauses;
@@ -345,6 +631,15 @@ final class WCSS_Smarter_Search
 
 		$clauses['orderby'] = "wcss_relevance DESC, {$wpdb->posts}.post_date DESC";
 
+		if (function_exists('wcss_console_debug_is_enabled') && wcss_console_debug_is_enabled()) {
+			wcss_console_debug_log('WCSS clauses', [
+				'where' => isset($clauses['where']) ? (string) $clauses['where'] : '',
+				'join' => isset($clauses['join']) ? (string) $clauses['join'] : '',
+				'groupby' => isset($clauses['groupby']) ? (string) $clauses['groupby'] : '',
+				'orderby' => isset($clauses['orderby']) ? (string) $clauses['orderby'] : '',
+			]);
+		}
+
 		return $clauses;
 	}
 
@@ -354,18 +649,23 @@ final class WCSS_Smarter_Search
 			return false;
 		}
 
-		$raw = $query->get('s');
-		$has_search_term = is_string($raw) && trim($raw) !== '';
-		if (!$query->is_search() && !$has_search_term) {
+		// IMPORTANT: we intentionally blank the public `s` query var to prevent core/host
+		// search SQL injection (often REGEXP). So we must NOT use `$query->get('s')` to
+		// decide whether to run; rely on our internal flag instead.
+		if ((int) $query->get('_wcss_enabled') !== 1) {
 			return false;
 		}
 
-		return (int) $query->get('_wcss_enabled') === 1;
+		$raw = $query->get('_wcss_raw_s');
+		return is_string($raw) && trim($raw) !== '';
 	}
 
 	private function get_like_terms(WP_Query $query): array
 	{
-		$raw = (string) $query->get('s');
+		$raw = (string) $query->get('_wcss_raw_s');
+		if ($raw === '') {
+			$raw = (string) $query->get('s');
+		}
 		$raw = trim($raw);
 		if ($raw === '') {
 			return ['exact' => [], 'fuzzy' => []];
@@ -373,16 +673,22 @@ final class WCSS_Smarter_Search
 
 		$payload = wcss_build_search_payload($raw);
 		if (function_exists('wcss_console_debug_log')) {
+			$exact_preview = isset($payload['exact_like_terms']) ? implode(' | ', array_slice((array) $payload['exact_like_terms'], 0, 8)) : '';
+			$fuzzy_preview = isset($payload['fuzzy_like_terms']) ? implode(' | ', array_slice((array) $payload['fuzzy_like_terms'], 0, 8)) : '';
 			wcss_console_debug_log('WCSS payload built', [
 				'raw' => $raw,
 				'exact_like_terms' => isset($payload['exact_like_terms']) ? (array) $payload['exact_like_terms'] : [],
 				'fuzzy_like_terms' => isset($payload['fuzzy_like_terms']) ? (array) $payload['fuzzy_like_terms'] : [],
+				'exact_preview' => $exact_preview,
+				'fuzzy_preview' => $fuzzy_preview,
 			]);
 		}
+
 
 		return [
 			'exact' => $payload['exact_like_terms'] ?? [],
 			'fuzzy' => $payload['fuzzy_like_terms'] ?? [],
+			'compact' => $payload['compact_like_terms'] ?? [],
 		];
 	}
 }
@@ -484,6 +790,18 @@ function wcss_build_search_payload(string $raw): array
 	}
 	$exact_like_terms = array_values(array_unique($exact_like_terms));
 
+	// Space-insensitive phrase matching (e.g., productname <-> product name).
+	$compact_like_terms = [];
+	$compact_phrase = preg_replace('/\s+/u', '', $lower);
+	$compact_phrase = is_string($compact_phrase) ? trim($compact_phrase) : '';
+	if ($compact_phrase !== '') {
+		$compact_len = function_exists('mb_strlen') ? mb_strlen($compact_phrase) : strlen($compact_phrase);
+		if ($compact_len >= 3) {
+			$compact_like_terms[] = '%' . $wpdb->esc_like($compact_phrase) . '%';
+		}
+	}
+	$compact_like_terms = array_values(array_unique($compact_like_terms));
+
 	// Fuzzy/typo-tolerant LIKE patterns (lightweight, bounded).
 	$fuzzy_like_terms = [];
 	$enable_fuzzy = apply_filters('wcss_enable_fuzzy', true, $raw);
@@ -500,6 +818,7 @@ function wcss_build_search_payload(string $raw): array
 	$payload = [
 		'exact_like_terms' => $exact_like_terms,
 		'fuzzy_like_terms' => $fuzzy_like_terms,
+		'compact_like_terms' => $compact_like_terms,
 	];
 
 	$payload = apply_filters('wcss_like_term_payload', $payload, $raw);
@@ -507,6 +826,7 @@ function wcss_build_search_payload(string $raw): array
 		return [
 			'exact_like_terms' => $exact_like_terms,
 			'fuzzy_like_terms' => $fuzzy_like_terms,
+			'compact_like_terms' => $compact_like_terms,
 		];
 	}
 
@@ -516,6 +836,7 @@ function wcss_build_search_payload(string $raw): array
 	return [
 		'exact_like_terms' => array_values(array_unique(array_filter((array) ($payload['exact_like_terms'] ?? [])))),
 		'fuzzy_like_terms' => array_values(array_unique(array_filter((array) ($payload['fuzzy_like_terms'] ?? [])))),
+		'compact_like_terms' => array_values(array_unique(array_filter((array) ($payload['compact_like_terms'] ?? [])))),
 	];
 }
 
@@ -545,7 +866,45 @@ function wcss_build_fuzzy_like_terms(array $tokens): array
 		}
 
 		$len = function_exists('mb_strlen') ? mb_strlen($token) : strlen($token);
-		if ($len < 3 || $len > 7) {
+		if ($len < 3) {
+			continue;
+		}
+
+		// For longer single-word tokens, try simple "word break" tolerance.
+		// Example: "brickhouse" should match "brick house" via "%brick%house%".
+		if ($len >= 8 && $len <= 14) {
+			$mid = (int) floor($len / 2);
+			$split_points = array_values(array_unique([
+				$mid - 1,
+				$mid,
+				$mid + 1,
+			]));
+
+			foreach ($split_points as $i) {
+				if ($i < 3 || $i > $len - 3) {
+					continue;
+				}
+
+				$left = function_exists('mb_substr') ? mb_substr($token, 0, $i) : substr($token, 0, $i);
+				$right = function_exists('mb_substr') ? mb_substr($token, $i) : substr($token, $i);
+				$left = trim($left);
+				$right = trim($right);
+				if ($left === '' || $right === '') {
+					continue;
+				}
+
+				$patterns[] = '%' . $wpdb->esc_like($left) . '%' . $wpdb->esc_like($right) . '%';
+				if (count($patterns) >= $max) {
+					break 2;
+				}
+			}
+
+			// Don't generate the more expensive short-token patterns for long strings.
+			continue;
+		}
+
+		// Keep the original typo-tolerance logic for short tokens.
+		if ($len > 7) {
 			continue;
 		}
 
@@ -560,15 +919,28 @@ function wcss_build_fuzzy_like_terms(array $tokens): array
 			}
 		}
 
+		// Extra tolerance for short-ish tokens: allow arbitrary characters between every letter.
+		// Example: token=sush => %s%u%s%h% matches "slush".
+		if ($len >= 4 && $len <= 5 && count($patterns) < $max) {
+			$chars = preg_split('//u', $token, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+			if (!empty($chars)) {
+				$chain = '%';
+				foreach ($chars as $ch) {
+					$chain .= $wpdb->esc_like($ch) . '%';
+				}
+				$patterns[] = $chain;
+			}
+		}
+
 		// Very short tokens (3 chars): also allow a wildcard between every character.
-		// token=abc => a%b%c
+		// token=abc => %a%b%c%
 		if ($len === 3 && count($patterns) < $max) {
 			$c1 = function_exists('mb_substr') ? mb_substr($token, 0, 1) : substr($token, 0, 1);
 			$c2 = function_exists('mb_substr') ? mb_substr($token, 1, 1) : substr($token, 1, 1);
 			$c3 = function_exists('mb_substr') ? mb_substr($token, 2, 1) : substr($token, 2, 1);
 			$patterns[] = '%' . $wpdb->esc_like($c1) . '%' . $wpdb->esc_like($c2) . '%' . $wpdb->esc_like($c3) . '%';
 		}
- 	}
+	}
 
 	$patterns = array_values(array_unique($patterns));
 	if (count($patterns) > $max) {
