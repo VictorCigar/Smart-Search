@@ -505,16 +505,12 @@ final class WCSS_Smarter_Search
 
 		foreach ($exact_terms as $term_like) {
 			$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
-			$or[] = $wpdb->prepare("{$wpdb->posts}.post_excerpt LIKE %s", $term_like);
-			$or[] = $wpdb->prepare("{$wpdb->posts}.post_content LIKE %s", $term_like);
 			$or[] = $wpdb->prepare('pm_sku.meta_value LIKE %s', $term_like);
 			$or[] = $wpdb->prepare('(wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)', $term_like, $term_like);
 		}
 
 		foreach ($fuzzy_terms as $term_like) {
 			$or[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $term_like);
-			$or[] = $wpdb->prepare("{$wpdb->posts}.post_excerpt LIKE %s", $term_like);
-			$or[] = $wpdb->prepare("{$wpdb->posts}.post_content LIKE %s", $term_like);
 			$or[] = $wpdb->prepare('pm_sku.meta_value LIKE %s', $term_like);
 			$or[] = $wpdb->prepare('(wcss_t.name LIKE %s OR wcss_t.slug LIKE %s)', $term_like, $term_like);
 		}
@@ -523,8 +519,6 @@ final class WCSS_Smarter_Search
 		// This uses REPLACE(..., ' ', '') so it only strips regular spaces (not all whitespace).
 		foreach ($compact_terms as $term_like) {
 			$or[] = $wpdb->prepare("REPLACE({$wpdb->posts}.post_title, ' ', '') LIKE %s", $term_like);
-			$or[] = $wpdb->prepare("REPLACE({$wpdb->posts}.post_excerpt, ' ', '') LIKE %s", $term_like);
-			$or[] = $wpdb->prepare("REPLACE({$wpdb->posts}.post_content, ' ', '') LIKE %s", $term_like);
 			$or[] = $wpdb->prepare("REPLACE(pm_sku.meta_value, ' ', '') LIKE %s", $term_like);
 			$or[] = $wpdb->prepare("(REPLACE(wcss_t.name, ' ', '') LIKE %s OR wcss_t.slug LIKE %s)", $term_like, $term_like);
 		}
@@ -597,8 +591,6 @@ final class WCSS_Smarter_Search
 				$term_like,
 				(int) $weights['taxonomy']
 			);
-			$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_excerpt LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['excerpt']);
-			$score_parts[] = $wpdb->prepare("(CASE WHEN {$wpdb->posts}.post_content LIKE %s THEN %d ELSE 0 END)", $term_like, (int) $weights['content']);
 		}
 
 		foreach ($fuzzy_terms as $term_like) {
