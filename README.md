@@ -57,6 +57,24 @@ add_filter('wcss_fuzzy_max_terms', function () {
 });
 ```
 
+Note: by default, fuzzy matching is only enabled for single-word searches because multi-word fuzzy patterns can become overly broad.
+
+### Token filtering (short words)
+The payload builder ignores very short tokens (length < 3) like `6` or `mg` *only when the query also contains longer tokens* (e.g. `slush peach fuzz 6 mg`). This reduces noisy matches that can pull unrelated products into results.
+
+If the query is made up entirely of short tokens (e.g. `6 mg`), those tokens are kept so those searches still work.
+
+### Preserve the public `s` query var
+By default, the plugin blanks the public WordPress search query var (`s`) on product searches to prevent other plugins/hosts from injecting alternative search SQL (often `REGEXP`) before WCSS builds its own LIKE-based matching.
+
+If you have theme code (or other plugins) that read `get_query_var('s')` and you want it to stay populated, disable that behavior:
+
+```php
+add_filter('wcss_blank_public_s', function ($blank, $query) {
+    return false;
+}, 10, 2);
+```
+
 ### Inspect/Override LIKE Payload
 ```php
 add_filter('wcss_like_term_payload', function ($payload, $raw) {
