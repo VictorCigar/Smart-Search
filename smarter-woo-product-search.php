@@ -3,7 +3,7 @@
  * Plugin Name: Smarter Woo Product Search
  * Description: Enhances the default WooCommerce product search (/?s=...&post_type=product) with weighting, SKU + taxonomy matching, partial matches, and synonyms — without changing the search form or URL structure.
  * Version: 0.1.17
- * Author: Custom
+ * Author: VO
  * Requires at least: 5.8
  * Requires PHP: 7.0
  * WC requires at least: 5.0
@@ -1104,8 +1104,11 @@ final class WCSS_Smarter_Search
 
 	private function should_handle_query(WP_Query $query): bool
 	{
-		if (is_admin() || !$query->is_main_query()) {
-			return false;
+		$forced = ((int) $query->get('_wcss_force') === 1);
+		if (!$forced) {
+			if (is_admin() || !$query->is_main_query()) {
+				return false;
+			}
 		}
 
 		// IMPORTANT: we intentionally blank the public `s` query var to prevent core/host
@@ -1157,6 +1160,39 @@ function wcss_maybe_bootstrap(): void
 	if (class_exists('WooCommerce') || function_exists('WC')) {
 		WCSS_Smarter_Search::init();
 	}
+}
+
+/**
+ * Run the smart search logic against a custom WP_Query (e.g., AJAX suggestions).
+ */
+function wcss_query_products_smart(string $term, array $args = []): WP_Query
+{
+	$term = wp_strip_all_tags($term);
+	$term = preg_replace('/\s+/u', ' ', trim($term));
+
+	WCSS_Smarter_Search::init();
+
+	$defaults = [
+		'post_type' => 'product',
+		'post_status' => 'publish',
+		'posts_per_page' => 16,
+		's' => '',
+		'ignore_sticky_posts' => true,
+		'no_found_rows' => true,
+		'_wcss_enabled' => 1,
+		'_wcss_raw_s' => $term,
+		'_wcss_force' => 1,
+	];
+
+	$query_args = wp_parse_args($args, $defaults);
+	$query_args['_wcss_enabled'] = 1;
+	$query_args['_wcss_raw_s'] = $term;
+	$query_args['_wcss_force'] = 1;
+	if (!isset($query_args['s'])) {
+		$query_args['s'] = '';
+	}
+
+	return new WP_Query($query_args);
 }
 
 add_action('plugins_loaded', 'wcss_maybe_bootstrap', 11);
